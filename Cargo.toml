@@ -1,0 +1,18 @@
+[package]
+name = "copy-path"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "CopyPath"
+path = "src/main.rs"
+
+[dependencies]
+winreg = "0.52"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
