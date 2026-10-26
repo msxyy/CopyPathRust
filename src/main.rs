@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case)]
+#![allow(clippy::upper_case_acronyms)]
 
 use std::env;
 use std::ffi::{c_void, OsString};
