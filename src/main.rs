@@ -588,7 +588,12 @@ fn uninstall() -> std::io::Result<()> {
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
-    for location in ["*", "Directory", "Directory\\Background", "DesktopBackground"] {
+    for location in [
+        "*",
+        "Directory",
+        "Directory\\Background",
+        "DesktopBackground",
+    ] {
         let base = format!(r"Software\Classes\{}\shell", location);
         if let Ok(key) = hkcu.open_subkey_with_flags(&base, KEY_READ) {
             let names: Vec<String> = key.enum_keys().filter_map(|r| r.ok()).collect();
