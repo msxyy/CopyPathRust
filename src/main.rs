@@ -4,6 +4,7 @@
 
 use std::env;
 use std::ffi::{c_void, OsString};
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::ptr;
 
@@ -23,6 +24,7 @@ const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
 const MOVEFILE_COPY_ALLOWED: u32 = 0x00000002;
 const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const MB_OK: u32 = 0x0000;
 const MB_ICONINFORMATION: u32 = 0x40;
@@ -281,7 +283,6 @@ fn replace_with_clipboard(src: &str) -> Result<(), String> {
         return Err("剪贴板内容为空".into());
     }
 
-    // 完整路径直接用；纯文件名按 src 同目录解析
     let target = if first.contains('\\') || first.contains('/') {
         first.to_string()
     } else {
@@ -290,6 +291,207 @@ fn replace_with_clipboard(src: &str) -> Result<(), String> {
     };
 
     move_overwrite(src, &target)
+}
+
+// ---------- 多平台 ADB 配置 ----------
+
+#[derive(Clone)]
+struct Platform {
+    key: String,
+    display_name: String,
+    adb_path: String,
+    serial: String,
+    paths: Vec<String>,
+}
+
+fn board_conf_path() -> Option<std::path::PathBuf> {
+    env::current_exe()
+        .ok()?
+        .parent()
+        .map(|p| p.join("board.conf"))
+}
+
+fn load_all_platforms() -> Vec<Platform> {
+    let conf = match board_conf_path() {
+        Some(p) if p.exists() => p,
+        _ => return Vec::new(),
+    };
+    let content = match std::fs::read_to_string(&conf) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut platforms: Vec<Platform> = Vec::new();
+    let mut current: Option<Platform> = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some(p) = current.take() {
+                platforms.push(p);
+            }
+            let name = line[1..line.len() - 1].trim();
+            current = Some(Platform {
+                key: name.to_string(),
+                display_name: name.to_string(),
+                adb_path: "adb".into(),
+                serial: String::new(),
+                paths: Vec::new(),
+            });
+        } else if let (Some(p), Some((k, v))) = (&mut current, line.split_once('=')) {
+            let v = v.trim().trim_matches('"');
+            match k.trim() {
+                "name" => p.display_name = v.to_string(),
+                "adb_path" => p.adb_path = v.to_string(),
+                "serial" => p.serial = v.to_string(),
+                "paths" => {
+                    for part in v.split(';') {
+                        let part = part.trim();
+                        if !part.is_empty() {
+                            p.paths.push(part.to_string());
+                        }
+                    }
+                }
+                "remote_dir" if !v.is_empty() => {
+                    p.paths.push(v.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(p) = current.take() {
+        platforms.push(p);
+    }
+    platforms.retain(|p| !p.paths.is_empty());
+    platforms
+}
+
+fn load_platform(key: &str) -> Result<Platform, String> {
+    load_all_platforms()
+        .into_iter()
+        .find(|p| p.key == key)
+        .ok_or_else(|| format!("board.conf 中没有找到平台 [{key}]"))
+}
+
+// ---------- ADB 操作 ----------
+
+fn run_adb(cfg: &Platform, args: &[&str]) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(&cfg.adb_path);
+    if !cfg.serial.is_empty() {
+        cmd.arg("-s").arg(&cfg.serial);
+    }
+    cmd.args(args);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd.output().map_err(|e| {
+        format!(
+            "执行 adb 失败：{e}\n\n\
+             请确认 adb 在 PATH 中，或在 board.conf 中配置 adb_path 指向 adb.exe 完整路径。"
+        )
+    })?;
+    if !out.status.success() {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{}{}", stdout.trim(), stderr.trim());
+        return Err(format!("adb 执行失败：\n\n{combined}"));
+    }
+    Ok(())
+}
+
+/// 执行 adb 并把 stdout+stderr 合并返回，不检查退出码
+/// 用于需要"读取输出内容判断"的场景，例如 ls 验证目录
+fn run_adb_check(cfg: &Platform, args: &[&str]) -> Result<String, String> {
+    let mut cmd = std::process::Command::new(&cfg.adb_path);
+    if !cfg.serial.is_empty() {
+        cmd.arg("-s").arg(&cfg.serial);
+    }
+    cmd.args(args);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let out = cmd.output().map_err(|e| {
+        format!(
+            "执行 adb 失败：{e}\n\n\
+             请确认 adb 在 PATH 中，或在 board.conf 中配置 adb_path 指向 adb.exe 完整路径。"
+        )
+    })?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Ok(format!("{}{}", stdout, stderr))
+}
+
+/// 判断目标路径是否需要 root 才能写
+/// /system 和 /vendor 是只读分区，必须 root + remount 才能写
+fn needs_root(remote_dir: &str) -> bool {
+    remote_dir.starts_with("/system") || remote_dir.starts_with("/vendor")
+}
+
+fn adb_push(platform_key: &str, remote_dir: &str, path: &str) -> Result<(), String> {
+    let cfg = load_platform(platform_key)?;
+
+    // 方案 B：只有 /system 和 /vendor 才自动 root + remount
+    // 失败不阻塞——用户版固件可能不支持 root，或 remount 触发 dm-verity
+    // 但不影响 /sdcard、/tmp 等本来就无需 root 的路径
+    if needs_root(remote_dir) {
+        let _ = run_adb_check(&cfg, &["root"]);
+        let _ = run_adb_check(&cfg, &["remount"]);
+    }
+
+    // 推送前验证远程目录存在
+    let check = run_adb_check(&cfg, &["shell", "ls", "-d", remote_dir])?;
+    let low = check.to_lowercase();
+
+    if low.contains("no such file") || low.contains("not found") {
+        return Err(format!(
+            "远程目录不存在：{remote_dir}\n\n\
+             请检查 board.conf 中的路径是否正确，或先在板子上创建该目录。\n\n\
+             adb 输出：{}",
+            check.trim()
+        ));
+    }
+    if low.contains("permission denied") {
+        return Err(format!(
+            "远程目录无读取权限：{remote_dir}\n\n\
+             自动执行 adb root && adb remount 后仍然失败，可能原因：\n\
+             1. 固件不支持 root（production build）\n\
+             2. dm-verity 未禁用，remount 无效\n\
+             3. 分区挂载为只读\n\n\
+             可尝试手动执行：\n\
+             adb root\n\
+             adb disable-verity\n\
+             adb reboot\n\
+             adb root\n\
+             adb remount\n\n\
+             adb 输出：{}",
+            check.trim()
+        ));
+    }
+
+    run_adb(&cfg, &["push", path, remote_dir])
+}
+
+fn adb_pull(platform_key: &str, remote_dir: &str, path: &str) -> Result<(), String> {
+    let cfg = load_platform(platform_key)?;
+    let name = Path::new(path)
+        .file_name()
+        .ok_or("无效的本地路径")?
+        .to_string_lossy()
+        .into_owned();
+    let remote = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
+    let parent = Path::new(path)
+        .parent()
+        .ok_or("无法获取本地目录")?
+        .display()
+        .to_string();
+    run_adb(&cfg, &["pull", &remote, &parent])
+}
+
+fn adb_pull_dir(platform_key: &str, remote_dir: &str, dir: &str) -> Result<(), String> {
+    let cfg = load_platform(platform_key)?;
+    let remote = format!("{}/.", remote_dir.trim_end_matches('/'));
+    run_adb(&cfg, &["pull", &remote, dir])
 }
 
 // ---------- 终端检测 ----------
@@ -394,18 +596,28 @@ fn registered_exe_path() -> Option<String> {
     Some(cmd[start..end].to_string())
 }
 
+struct SubItem {
+    key: String,
+    display_name: String,
+    command: String,
+    children: Option<Vec<SubItem>>,
+}
+
+enum MenuKind {
+    Command(String),
+    Cascade(Vec<SubItem>),
+}
+
 struct MenuEntry {
     key: String,
     location: &'static str,
     name: String,
-    command: String,
+    kind: MenuKind,
     icon: String,
-    // None = 不写 MultiSelectModel（背景位置）
-    // Some("Player"/"Single") = 写入对应值
     model: Option<&'static str>,
 }
 
-fn entry(
+fn entry_cmd(
     location: &'static str,
     key_suffix: &str,
     name: &str,
@@ -417,7 +629,25 @@ fn entry(
         key: format!("CopyPath.{}", key_suffix),
         location,
         name: name.to_string(),
-        command,
+        kind: MenuKind::Command(command),
+        icon: icon.to_string(),
+        model,
+    }
+}
+
+fn entry_cascade(
+    location: &'static str,
+    key_suffix: &str,
+    name: &str,
+    subs: Vec<SubItem>,
+    icon: &str,
+    model: Option<&'static str>,
+) -> MenuEntry {
+    MenuEntry {
+        key: format!("CopyPath.{}", key_suffix),
+        location,
+        name: name.to_string(),
+        kind: MenuKind::Cascade(subs),
         icon: icon.to_string(),
         model,
     }
@@ -436,7 +666,7 @@ fn terminal_entries(location: &'static str, placeholder: &str) -> Vec<MenuEntry>
     };
 
     if let Some(p) = detect_pwsh() {
-        v.push(entry(
+        v.push(entry_cmd(
             location,
             "05_pwsh",
             "在此打开 PowerShell 7",
@@ -449,7 +679,7 @@ fn terminal_entries(location: &'static str, placeholder: &str) -> Vec<MenuEntry>
         ));
     }
 
-    v.push(entry(
+    v.push(entry_cmd(
         location,
         "06_ps",
         "在此打开 Windows PowerShell",
@@ -461,7 +691,7 @@ fn terminal_entries(location: &'static str, placeholder: &str) -> Vec<MenuEntry>
         model,
     ));
 
-    v.push(entry(
+    v.push(entry_cmd(
         location,
         "07_cmd",
         "在此打开命令提示符",
@@ -471,7 +701,7 @@ fn terminal_entries(location: &'static str, placeholder: &str) -> Vec<MenuEntry>
     ));
 
     if let Some(c) = detect_cmder() {
-        v.push(entry(
+        v.push(entry_cmd(
             location,
             "08_cmder",
             "在此打开 Cmder",
@@ -484,20 +714,82 @@ fn terminal_entries(location: &'static str, placeholder: &str) -> Vec<MenuEntry>
     v
 }
 
+fn adb_cascade_entries(
+    location: &'static str,
+    key_suffix: &str,
+    label: &str,
+    action: &str,
+    placeholder: &str,
+    model: Option<&'static str>,
+    platforms: &[Platform],
+) -> Option<MenuEntry> {
+    if platforms.is_empty() {
+        return None;
+    }
+    let exe = current_exe_path().unwrap_or_default();
+    let qexe = format!("\"{}\"", exe);
+
+    let subs: Vec<SubItem> = platforms
+        .iter()
+        .map(|p| {
+            let path_children: Vec<SubItem> = p
+                .paths
+                .iter()
+                .enumerate()
+                .map(|(i, dir)| SubItem {
+                    key: format!("path_{}", i),
+                    display_name: dir.clone(),
+                    command: format!(
+                        "{} {} \"{}\" \"{}\" \"{}\"",
+                        qexe, action, p.key, dir, placeholder
+                    ),
+                    children: None,
+                })
+                .collect();
+
+            if path_children.len() == 1 {
+                let child = &path_children[0];
+                SubItem {
+                    key: p.key.clone(),
+                    display_name: p.display_name.clone(),
+                    command: child.command.clone(),
+                    children: None,
+                }
+            } else {
+                SubItem {
+                    key: p.key.clone(),
+                    display_name: p.display_name.clone(),
+                    command: String::new(),
+                    children: Some(path_children),
+                }
+            }
+        })
+        .collect();
+
+    Some(entry_cascade(
+        location,
+        key_suffix,
+        label,
+        subs,
+        "shell32.dll,167",
+        model,
+    ))
+}
+
 fn menu_entries() -> Vec<MenuEntry> {
     let exe = current_exe_path().unwrap_or_default();
     let qexe = format!("\"{}\"", exe);
     let copy_icon = "imageres.dll,-5302";
+    let platforms = load_all_platforms();
     let mut v = Vec::new();
 
-    // 文件右键：复制类
     for (sfx, name, mode) in [
         ("01_path", "复制路径", "--copy-path"),
         ("02_name", "复制文件名", "--copy-name"),
         ("03_dir", "复制所在目录", "--copy-dir"),
         ("04_quoted", "复制带引号路径", "--copy-quoted"),
     ] {
-        v.push(entry(
+        v.push(entry_cmd(
             "*",
             sfx,
             name,
@@ -507,8 +799,7 @@ fn menu_entries() -> Vec<MenuEntry> {
         ));
     }
 
-    // 文件右键：替换为剪贴板中的文件（单选）
-    v.push(entry(
+    v.push(entry_cmd(
         "*",
         "05_replace",
         "替换为剪贴板中的文件",
@@ -517,14 +808,36 @@ fn menu_entries() -> Vec<MenuEntry> {
         Some("Single"),
     ));
 
-    // 文件夹右键：复制类
+    if let Some(e) = adb_cascade_entries(
+        "*",
+        "06_adb_push",
+        "推送到板子",
+        "--adb-push",
+        "%1",
+        Some("Single"),
+        &platforms,
+    ) {
+        v.push(e);
+    }
+    if let Some(e) = adb_cascade_entries(
+        "*",
+        "07_adb_pull",
+        "从板子拉取",
+        "--adb-pull",
+        "%1",
+        Some("Single"),
+        &platforms,
+    ) {
+        v.push(e);
+    }
+
     for (sfx, name, mode) in [
         ("01_path", "复制路径", "--copy-path"),
         ("02_name", "复制文件夹名", "--copy-name"),
         ("03_dir", "复制所在目录", "--copy-dir"),
         ("04_quoted", "复制带引号路径", "--copy-quoted"),
     ] {
-        v.push(entry(
+        v.push(entry_cmd(
             "Directory",
             sfx,
             name,
@@ -535,12 +848,34 @@ fn menu_entries() -> Vec<MenuEntry> {
     }
     v.extend(terminal_entries("Directory", "%1"));
 
-    // 文件夹空白处
+    if let Some(e) = adb_cascade_entries(
+        "Directory",
+        "09_adb_push",
+        "推送此文件夹到板子",
+        "--adb-push",
+        "%1",
+        Some("Single"),
+        &platforms,
+    ) {
+        v.push(e);
+    }
+    if let Some(e) = adb_cascade_entries(
+        "Directory",
+        "10_adb_pull",
+        "从板子拉取到此文件夹",
+        "--adb-pull-dir",
+        "%1",
+        Some("Single"),
+        &platforms,
+    ) {
+        v.push(e);
+    }
+
     for (sfx, name, mode) in [
         ("01_path", "复制当前路径", "--copy-path"),
         ("04_quoted", "复制当前路径(带引号)", "--copy-quoted"),
     ] {
-        v.push(entry(
+        v.push(entry_cmd(
             "Directory\\Background",
             sfx,
             name,
@@ -551,7 +886,51 @@ fn menu_entries() -> Vec<MenuEntry> {
     }
     v.extend(terminal_entries("Directory\\Background", "%V"));
 
+    if let Some(e) = adb_cascade_entries(
+        "Directory\\Background",
+        "09_adb_push",
+        "推送当前文件夹到板子",
+        "--adb-push",
+        "%V",
+        None,
+        &platforms,
+    ) {
+        v.push(e);
+    }
+    if let Some(e) = adb_cascade_entries(
+        "Directory\\Background",
+        "10_adb_pull",
+        "从板子拉取到当前文件夹",
+        "--adb-pull-dir",
+        "%V",
+        None,
+        &platforms,
+    ) {
+        v.push(e);
+    }
+
     v
+}
+
+fn install_subitem(parent: &winreg::RegKey, sub: &SubItem) -> std::io::Result<()> {
+    let (sub_key, _) = parent.create_subkey(&sub.key)?;
+    sub_key.set_value("MUIVerb", &sub.display_name)?;
+    let _ = sub_key.delete_value("");
+
+    if let Some(children) = &sub.children {
+        let _ = sub_key.delete_subkey_all("command");
+        sub_key.set_value("SubCommands", &"")?;
+        let (shell_key, _) = sub_key.create_subkey("shell")?;
+        for child in children {
+            install_subitem(&shell_key, child)?;
+        }
+    } else {
+        let _ = sub_key.delete_subkey_all("shell");
+        let _ = sub_key.delete_value("SubCommands");
+        let (cmd_key, _) = sub_key.create_subkey("command")?;
+        cmd_key.set_value("", &sub.command)?;
+    }
+    Ok(())
 }
 
 fn install() -> std::io::Result<()> {
@@ -559,18 +938,11 @@ fn install() -> std::io::Result<()> {
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
-    for old in [
-        r"Software\Classes\*\shell\CopyFilePath",
-        r"Software\Classes\Directory\shell\CopyFolderPath",
-        r"Software\Classes\Directory\Background\shell\CopyCurrentPath",
-    ] {
-        let _ = hkcu.delete_subkey_all(old);
-    }
+    let _ = uninstall();
 
     for e in menu_entries() {
         let path = format!(r"Software\Classes\{}\shell\{}", e.location, e.key);
         let (key, _) = hkcu.create_subkey(&path)?;
-        key.set_value("", &e.name)?;
         key.set_value("Icon", &e.icon)?;
 
         let _ = key.delete_value("MultiSelectModel");
@@ -578,8 +950,26 @@ fn install() -> std::io::Result<()> {
             key.set_value("MultiSelectModel", &m.to_string())?;
         }
 
-        let (cmd_key, _) = key.create_subkey("command")?;
-        cmd_key.set_value("", &e.command)?;
+        match &e.kind {
+            MenuKind::Command(cmd) => {
+                key.set_value("", &e.name)?;
+                let _ = key.delete_value("MUIVerb");
+                let _ = key.delete_value("SubCommands");
+                let _ = key.delete_subkey_all("shell");
+                let (cmd_key, _) = key.create_subkey("command")?;
+                cmd_key.set_value("", cmd)?;
+            }
+            MenuKind::Cascade(subs) => {
+                let _ = key.delete_value("");
+                key.set_value("MUIVerb", &e.name)?;
+                let _ = key.delete_subkey_all("command");
+                key.set_value("SubCommands", &"")?;
+                let (shell_key, _) = key.create_subkey("shell")?;
+                for sub in subs {
+                    install_subitem(&shell_key, sub)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -618,6 +1008,30 @@ fn uninstall() -> std::io::Result<()> {
 
 // ---------- GUI ----------
 
+fn adb_status_lines() -> String {
+    let platforms = load_all_platforms();
+    if platforms.is_empty() {
+        return "ADB 平台：❌ 未配置（需要在 exe 旁放 board.conf）\n".to_string();
+    }
+    let mut out = String::from("ADB 平台：\n");
+    for p in platforms {
+        let serial = if p.serial.is_empty() {
+            "未指定 serial".to_string()
+        } else {
+            format!("serial={}", p.serial)
+        };
+        out.push_str(&format!("  {}（{}）：", p.display_name, serial));
+        for (i, dir) in p.paths.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" / ");
+            }
+            out.push_str(dir);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn get_status_text() -> String {
     let current = current_exe_path().unwrap_or_default();
 
@@ -646,6 +1060,8 @@ fn get_status_text() -> String {
         diag.push_str("  （未检测到可选的 PowerShell 7 / Cmder）\n");
     }
 
+    let adb_lines = adb_status_lines();
+
     match registered_exe_path() {
         Some(p) if p.eq_ignore_ascii_case(&current) => format!(
             r#"状态：✅ 已安装
@@ -654,16 +1070,31 @@ fn get_status_text() -> String {
 
 检测到的终端：
 {diag}
+{adb_lines}
 文件右键：复制路径 / 复制文件名 / 复制所在目录 / 复制带引号路径
 　　　　　替换为剪贴板中的文件
+　　　　　推送到板子 ▶ / 从板子拉取 ▶
 文件夹右键：复制路径 / 复制文件夹名 / 复制所在目录 / 复制带引号路径
 　　　　　在此打开 {terms}
+　　　　　推送此文件夹到板子 ▶ / 从板子拉取到此文件夹 ▶
 文件夹空白处右键：复制当前路径 / 复制当前路径(带引号)
 　　　　　　　　在此打开 {terms}
+　　　　　　　　推送当前文件夹到板子 ▶ / 从板子拉取到当前文件夹 ▶
 
-替换用法：
-  跨目录：右键旧文件 → 复制路径；右键新文件 → 替换为剪贴板中的文件
-  同目录：右键旧文件 → 复制文件名；右键新文件 → 替换为剪贴板中的文件
+ADB 配置示例（board.conf）：
+  [ingenic]
+  name=君正
+  paths=/system/config/;/system/bin/;/system/lib/modules/;/system/init/;/system/etc/sensor/;/tmp/
+
+  [rockchip]
+  name=瑞芯微
+  paths=/sdcard/;/vendor/etc/camera/rkisp2/;/vendor/etc/camera/;/vendor/bin/
+
+  多个路径用分号分隔；修改 board.conf 后需要重新点「安装」才能刷新菜单。
+
+推送到 /system 或 /vendor 时会自动执行 adb root && adb remount；
+推送到 /sdcard、/tmp 等不需要 root 的路径不执行任何额外操作。
+推送前会验证远程目录存在，不存在会弹错误提示，不会静默失败。
 
 小技巧：按住 Shift 点「复制路径」=「复制带引号路径」。
 Windows 11 用户如未见菜单项，请点击「显示更多选项」。"#
@@ -676,6 +1107,7 @@ Windows 11 用户如未见菜单项，请点击「显示更多选项」。"#
 
 检测到的终端：
 {diag}
+{adb_lines}
 菜单项会失效，点「安装」重新注册到当前位置。"#
         ),
         None => format!(
@@ -685,15 +1117,29 @@ Windows 11 用户如未见菜单项，请点击「显示更多选项」。"#
 
 检测到的终端：
 {diag}
+{adb_lines}
 点击「安装」将添加以下菜单项：
 文件右键：复制路径 / 复制文件名 / 复制所在目录 / 复制带引号路径
 　　　　　替换为剪贴板中的文件
+　　　　　推送到板子 ▶ / 从板子拉取 ▶
 文件夹右键：复制路径 / 复制文件夹名 / 复制所在目录 / 复制带引号路径
 　　　　　在此打开 {terms}
+　　　　　推送此文件夹到板子 ▶ / 从板子拉取到此文件夹 ▶
 文件夹空白处右键：复制当前路径 / 复制当前路径(带引号)
 　　　　　　　　在此打开 {terms}
+　　　　　　　　推送当前文件夹到板子 ▶ / 从板子拉取到当前文件夹 ▶
 
-PowerShell 7 与 Cmder 为自动检测：未安装则不注册该项。"#
+ADB 配置（第一次使用必看）：
+  在 exe 同目录新建 board.conf，示例：
+  [ingenic]
+  name=君正
+  paths=/system/config/;/system/bin/;/system/lib/modules/;/system/init/;/system/etc/sensor/;/tmp/
+
+  [rockchip]
+  name=瑞芯微
+  paths=/sdcard/;/vendor/etc/camera/rkisp2/;/vendor/etc/camera/;/vendor/bin/
+
+  多个路径用分号分隔。修改后重新点「安装」即可生效。"#
         ),
     }
 }
@@ -721,7 +1167,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: usize, lparam: i
                 20,
                 20,
                 760,
-                480,
+                640,
                 hwnd,
                 ID_STATUS as HMENU,
                 hinst,
@@ -741,7 +1187,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: usize, lparam: i
                     t.as_ptr(),
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                     x,
-                    520,
+                    680,
                     120,
                     34,
                     hwnd,
@@ -805,7 +1251,7 @@ fn run_gui() {
             left: 0,
             top: 0,
             right: 800,
-            bottom: 590,
+            bottom: 750,
         };
         AdjustWindowRect(&mut rc, style, 0);
 
@@ -883,6 +1329,33 @@ fn main() {
                 if let Err(e) = replace_with_clipboard(&src) {
                     msg(&e, "CopyPath - 替换失败", MB_ICONERROR);
                 }
+            }
+            return;
+        }
+        "--adb-push" | "--adb-pull" | "--adb-pull-dir" => {
+            if args.len() < 4 {
+                msg(
+                    &format!(
+                        "{} 参数不足。\n\n\
+                         用法：<exe> {} <platform> <remote_dir> <path>\n\
+                         通常由右键菜单自动调用，不需要手动执行。",
+                        mode, mode
+                    ),
+                    "CopyPath",
+                    MB_ICONERROR,
+                );
+                return;
+            }
+            let platform = args[1].to_string_lossy().into_owned();
+            let remote_dir = args[2].to_string_lossy().into_owned();
+            let path = args[3].to_string_lossy().into_owned();
+            let res = match mode.as_str() {
+                "--adb-push" => adb_push(&platform, &remote_dir, &path),
+                "--adb-pull" => adb_pull(&platform, &remote_dir, &path),
+                _ => adb_pull_dir(&platform, &remote_dir, &path),
+            };
+            if let Err(e) = res {
+                msg(&e, "CopyPath - ADB 操作失败", MB_ICONERROR);
             }
             return;
         }
