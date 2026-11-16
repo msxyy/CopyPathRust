@@ -56,6 +56,11 @@ const ID_BTN_INSTALL: isize = 101;
 const ID_BTN_UNINSTALL: isize = 102;
 const ID_BTN_CLOSE: isize = 103;
 
+/// 编译期嵌入的默认配置（项目根目录的 board.conf）
+/// 外部 board.conf 存在时优先用外部，不存在时用这个
+/// 首次安装时自动写到 exe 旁边，方便用户后续编辑
+const EMBEDDED_CONF: &str = include_str!("../board.conf");
+
 #[repr(C)]
 struct RECT {
     left: i32,
@@ -311,16 +316,37 @@ fn board_conf_path() -> Option<std::path::PathBuf> {
         .map(|p| p.join("board.conf"))
 }
 
-fn load_all_platforms() -> Vec<Platform> {
+/// 如果 exe 旁边没有 board.conf，就把嵌入的默认配置写出来
+/// 写失败（只读目录、权限不足）静默忽略，不影响主流程
+fn ensure_board_conf_exists() {
     let conf = match board_conf_path() {
-        Some(p) if p.exists() => p,
-        _ => return Vec::new(),
+        Some(p) => p,
+        None => return,
     };
-    let content = match std::fs::read_to_string(&conf) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    if conf.exists() {
+        return;
+    }
+    let _ = std::fs::write(&conf, EMBEDDED_CONF);
+}
 
+fn load_all_platforms() -> Vec<Platform> {
+    // 首次运行时自动生成外部配置文件，方便用户后续编辑
+    ensure_board_conf_exists();
+
+    // 优先读外部文件
+    if let Some(conf) = board_conf_path() {
+        if conf.exists() {
+            if let Ok(content) = std::fs::read_to_string(&conf) {
+                return parse_conf(&content);
+            }
+        }
+    }
+
+    // 外部读不到（不存在或读取失败），用嵌入的
+    parse_conf(EMBEDDED_CONF)
+}
+
+fn parse_conf(content: &str) -> Vec<Platform> {
     let mut platforms: Vec<Platform> = Vec::new();
     let mut current: Option<Platform> = None;
 
@@ -433,7 +459,6 @@ fn adb_push(platform_key: &str, remote_dir: &str, path: &str) -> Result<(), Stri
 
     // 方案 B：只有 /system 和 /vendor 才自动 root + remount
     // 失败不阻塞——用户版固件可能不支持 root，或 remount 触发 dm-verity
-    // 但不影响 /sdcard、/tmp 等本来就无需 root 的路径
     if needs_root(remote_dir) {
         let _ = run_adb_check(&cfg, &["root"]);
         let _ = run_adb_check(&cfg, &["remount"]);
@@ -938,6 +963,9 @@ fn install() -> std::io::Result<()> {
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
+    // 首次安装时把嵌入的配置写到 exe 旁边，方便用户后续编辑
+    ensure_board_conf_exists();
+
     let _ = uninstall();
 
     for e in menu_entries() {
@@ -1011,7 +1039,7 @@ fn uninstall() -> std::io::Result<()> {
 fn adb_status_lines() -> String {
     let platforms = load_all_platforms();
     if platforms.is_empty() {
-        return "ADB 平台：❌ 未配置（需要在 exe 旁放 board.conf）\n".to_string();
+        return "ADB 平台：❌ 未配置\n".to_string();
     }
     let mut out = String::from("ADB 平台：\n");
     for p in platforms {
@@ -1081,20 +1109,14 @@ fn get_status_text() -> String {
 　　　　　　　　在此打开 {terms}
 　　　　　　　　推送当前文件夹到板子 ▶ / 从板子拉取到当前文件夹 ▶
 
-ADB 配置示例（board.conf）：
-  [ingenic]
-  name=君正
-  paths=/system/config/;/system/bin/;/system/lib/modules/;/system/init/;/system/etc/sensor/;/tmp/
+ADB 配置说明：
+  board.conf 已嵌入 exe，首次安装时会自动写到 exe 旁边。
+  优先读外部 board.conf（可编辑），不存在时用嵌入的默认配置。
+  改配置后需要重新点「安装」才能刷新菜单。
 
-  [rockchip]
-  name=瑞芯微
-  paths=/sdcard/;/vendor/etc/camera/rkisp2/;/vendor/etc/camera/;/vendor/bin/
-
-  多个路径用分号分隔；修改 board.conf 后需要重新点「安装」才能刷新菜单。
-
-推送到 /system 或 /vendor 时会自动执行 adb root && adb remount；
-推送到 /sdcard、/tmp 等不需要 root 的路径不执行任何额外操作。
-推送前会验证远程目录存在，不存在会弹错误提示，不会静默失败。
+  推送到 /system 或 /vendor 时会自动执行 adb root && adb remount；
+  推送到 /sdcard、/tmp 等不需要 root 的路径不执行任何额外操作。
+  推送前会验证远程目录存在，不存在会弹错误提示。
 
 小技巧：按住 Shift 点「复制路径」=「复制带引号路径」。
 Windows 11 用户如未见菜单项，请点击「显示更多选项」。"#
@@ -1129,17 +1151,10 @@ Windows 11 用户如未见菜单项，请点击「显示更多选项」。"#
 　　　　　　　　在此打开 {terms}
 　　　　　　　　推送当前文件夹到板子 ▶ / 从板子拉取到当前文件夹 ▶
 
-ADB 配置（第一次使用必看）：
-  在 exe 同目录新建 board.conf，示例：
-  [ingenic]
-  name=君正
-  paths=/system/config/;/system/bin/;/system/lib/modules/;/system/init/;/system/etc/sensor/;/tmp/
-
-  [rockchip]
-  name=瑞芯微
-  paths=/sdcard/;/vendor/etc/camera/rkisp2/;/vendor/etc/camera/;/vendor/bin/
-
-  多个路径用分号分隔。修改后重新点「安装」即可生效。"#
+ADB 配置说明：
+  board.conf 已嵌入 exe，首次安装时会自动写到 exe 旁边。
+  优先读外部 board.conf（可编辑），不存在时用嵌入的默认配置。
+  修改后重新点「安装」即可生效。"#
         ),
     }
 }
